@@ -1,0 +1,280 @@
+---
+# Tekton Pipeline for building and deploying the SRE Simulator
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: sre-simulator-pipeline
+  namespace: sre-simulator
+spec:
+  params:
+  - name: git-url
+    type: string
+    description: Git repository URL
+    default: https://github.com/your-org/openshift-sre-simulator.git
+  - name: git-revision
+    type: string
+    description: Git revision (branch/tag)
+    default: main
+  - name: image-registry
+    type: string
+    description: Container image registry
+    default: image-registry.openshift-image-registry.svc:5000
+  - name: image-namespace
+    type: string
+    description: Container image namespace
+    default: sre-simulator
+  - name: image-name
+    type: string
+    description: Container image name
+    default: sre-simulator
+  
+  workspaces:
+  - name: shared-workspace
+  - name: docker-config
+    optional: true
+  
+  tasks:
+  # Clone the repository
+  - name: clone-repo
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    workspaces:
+    - name: output
+      workspace: shared-workspace
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: revision
+      value: $(params.git-revision)
+    - name: deleteExisting
+      value: "true"
+  
+  # Build the container image
+  - name: build-image
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    runAfter:
+    - clone-repo
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+    params:
+    - name: IMAGE
+      value: $(params.image-registry)/$(params.image-namespace)/$(params.image-name):latest
+    - name: BUILDER_IMAGE
+      value: quay.io/buildah/stable:latest
+    - name: DOCKERFILE
+      value: ./Dockerfile
+    - name: CONTEXT
+      value: .
+    - name: TLSVERIFY
+      value: "true"
+  
+  # Push the image to the registry
+  - name: push-image
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    runAfter:
+    - build-image
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+    params:
+    - name: IMAGE
+      value: $(params.image-registry)/$(params.image-namespace)/$(params.image-name):latest
+    - name: PUSH
+      value: "true"
+  
+  # Deploy to OpenShift
+  - name: deploy
+    taskRef:
+      name: openshift-client
+      kind: ClusterTask
+    runAfter:
+    - push-image
+    params:
+    - name: SCRIPT
+      value: |
+        #!/bin/bash
+        set -e
+        
+        echo "Deploying SRE Simulator to OpenShift..."
+        
+        # Apply deployment manifests
+        oc apply -f openshift-deployment.yaml
+        
+        # Wait for rollout
+        oc rollout status deployment/sre-simulator -n sre-simulator --timeout=5m
+        
+        # Get the route URL
+        ROUTE=$(oc get route sre-simulator -n sre-simulator -o jsonpath='{.spec.host}')
+        echo "Application deployed successfully!"
+        echo "Access the application at: https://$ROUTE"
+    workspaces:
+    - name: source
+      workspace: shared-workspace
+
+---
+# PipelineRun for manual execution
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  name: sre-simulator-pipeline-run
+  namespace: sre-simulator
+spec:
+  pipelineRef:
+    name: sre-simulator-pipeline
+  workspaces:
+  - name: shared-workspace
+    volumeClaimTemplate:
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+  params:
+  - name: git-url
+    value: https://github.com/your-org/openshift-sre-simulator.git
+  - name: git-revision
+    value: main
+  - name: image-registry
+    value: image-registry.openshift-image-registry.svc:5000
+  - name: image-namespace
+    value: sre-simulator
+  - name: image-name
+    value: sre-simulator
+
+---
+# EventListener for GitHub webhook integration
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: sre-simulator-listener
+  namespace: sre-simulator
+spec:
+  serviceAccountName: sre-simulator-trigger
+  triggers:
+  - name: github-push
+    interceptors:
+    - ref:
+        name: github
+        kind: ClusterInterceptor
+      params:
+      - name: secretRef
+        value:
+          secretKey: github-secret
+          secretName: github-webhook-secret
+    - name: "validate-payload"
+      ref:
+        name: cel
+        kind: ClusterInterceptor
+      params:
+      - name: filter
+        value: "body.ref == 'refs/heads/main'"
+    bindings:
+    - ref: sre-simulator-binding
+    template:
+      ref: sre-simulator-trigger-template
+
+---
+# TriggerBinding
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: sre-simulator-binding
+  namespace: sre-simulator
+spec:
+  params:
+  - name: git-url
+    value: $(body.repository.clone_url)
+  - name: git-revision
+    value: $(body.ref)
+
+---
+# TriggerTemplate
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: sre-simulator-trigger-template
+  namespace: sre-simulator
+spec:
+  params:
+  - name: git-url
+  - name: git-revision
+  resourcetemplates:
+  - apiVersion: tekton.dev/v1beta1
+    kind: PipelineRun
+    metadata:
+      generateName: sre-simulator-pipeline-run-
+      namespace: sre-simulator
+    spec:
+      pipelineRef:
+        name: sre-simulator-pipeline
+      workspaces:
+      - name: shared-workspace
+        volumeClaimTemplate:
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+      params:
+      - name: git-url
+        value: $(tt.params.git-url)
+      - name: git-revision
+        value: $(tt.params.git-revision)
+
+---
+# ServiceAccount for triggers
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-simulator-trigger
+  namespace: sre-simulator
+
+---
+# ClusterRole for trigger service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sre-simulator-trigger-role
+rules:
+- apiGroups:
+  - tekton.dev
+  resources:
+  - pipelineruns
+  - taskruns
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - pods/log
+  verbs:
+  - get
+  - list
+  - watch
+
+---
+# ClusterRoleBinding for trigger service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sre-simulator-trigger-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sre-simulator-trigger-role
+subjects:
+- kind: ServiceAccount
+  name: sre-simulator-trigger
+  namespace: sre-simulator
