@@ -1,4 +1,4 @@
-name: OpenShift Auto-Trigger for openshift 
+name: OpenShift Auto-Trigger for 
 on:
   push:
     branches: [ main ]  
