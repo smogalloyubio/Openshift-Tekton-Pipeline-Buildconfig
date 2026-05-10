@@ -1,0 +1,24 @@
+name: OpenShift Auto-Trigger
+on:
+  push:
+    branches: [ main ]  
+
+jobs:
+  trigger-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Authenticate with OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+
+      - name: Trigger Build via Webhook
+        run: |
+          curl -k -X POST -H "Authorization: Bearer ${{ secrets.OPENSHIFT_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          ${{ secrets.OPENSHIFT_SERVER }}/apis/build.openshift.io/v1/namespaces/ubiowororuki-dev/buildconfigs/myapp-dev/webhooks/${{ secrets.WEBHOOK_SECRET }}/generic
